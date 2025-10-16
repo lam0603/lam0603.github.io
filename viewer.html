@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>AR Room Viewer (GLB/GLTF/USDZ + objects.json)</title>
+<style>
+  html,body { height:100%; margin:0; background:#0b0b0c; color:#eee; font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;}
+  #ui { position:fixed; top:10px; left:10px; z-index:10; background:rgba(0,0,0,.5); padding:10px 12px; border-radius:8px; backdrop-filter: blur(6px); }
+  #log { position:fixed; left:10px; bottom:10px; z-index:10; width:min(480px, 90vw); max-height:35vh; overflow:auto; background:rgba(0,0,0,.5); padding:8px 10px; border-radius:8px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space:pre-wrap; }
+  #c { position:fixed; inset:0; display:block; }
+  label { display:block; margin:6px 0 4px; opacity:.9}
+  input[type=file] { display:block; }
+  small { opacity:.8 }
+  button { margin-top:8px; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <label>1) Chọn mô hình phòng (GLB/GLTF **hoặc** USDZ):</label>
+  <input id="modelInput" type="file" accept=".glb,.gltf,.usdz,.usd,.usdc,.usda" />
+  <label>2) Chọn objects.json:</label>
+  <input id="jsonInput" type="file" accept=".json" />
+  <button id="resetBtn">Reset scene</button>
+  <small>Đơn vị: mét. Nếu <b>space</b>="room-local": <code>roomTransform * object.transform</code>.</small>
+</div>
+<pre id="log"></pre>
+<canvas id="c"></canvas>
+
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.159.0/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.159.0/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader } from 'https://unpkg.com/three@0.159.0/examples/jsm/loaders/GLTFLoader.js';
+import { USDZLoader } from 'https://unpkg.com/three@0.159.0/examples/jsm/loaders/USDZLoader.js';
+
+const canvas = document.getElementById('c');
+const logEl  = document.getElementById('log');
+const modelInput = document.getElementById('modelInput');
+const jsonInput  = document.getElementById('jsonInput');
+const resetBtn   = document.getElementById('resetBtn');
+
+function log(...args){ console.log(...args); logEl.textContent += args.join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+function clearLog(){ logEl.textContent = ''; }
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0b0c);
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.01, 1000);
+camera.position.set(1.2, 1.0, 1.8);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.6, 0);
+controls.update();
+
+const hemi = new THREE.HemisphereLight(0xffffff, 0x222233, 0.8);
+scene.add(hemi);
+const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+dir.position.set(2, 3, 2);
+scene.add(dir);
+
+const grid = new THREE.GridHelper(10, 100, 0x334455, 0x223344);
+grid.position.y = 0;
+scene.add(grid);
+
+// Keep references so we can reset/reload
+let roomRoot = new THREE.Group(); // where room model goes
+let objectsRoot = new THREE.Group(); // where boxes/text go
+scene.add(roomRoot);
+scene.add(objectsRoot);
+
+function resetScene() {
+  clearLog();
+  for (const root of [roomRoot, objectsRoot]) {
+    while (root.children.length) root.remove(root.children[0]);
+  }
+  roomRoot.matrix.identity(); roomRoot.matrixAutoUpdate = false;
+  log('Scene reset.');
+}
+resetBtn.addEventListener('click', resetScene);
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+let lastModelBlobURL = null;
+let lastJSON = null;
+
+// Parse 4x4 column-major (iOS simd_float4x4.arr16) -> THREE.Matrix4 (expects column-major as well)
+function mat4FromArray16(a) {
+  const m = new THREE.Matrix4();
+  if (!Array.isArray(a) || a.length !== 16) return m.identity();
+  return m.fromArray(a); // both are column-major
+}
+
+// Build one object by type
+function buildObject(webObj) {
+  const t = webObj.type;
+  const props = webObj.props || {};
+  let node;
+
+  if (t === 'box') {
+    const base = parseFloat(props.baseSize || '0.05') || 0.05; // meters
+    const geo = new THREE.BoxGeometry(base, base, base);
+    const color = props.color || '#0000FF';
+    const mat = new THREE.MeshStandardMaterial({ color });
+    node = new THREE.Mesh(geo, mat);
+  } else if (t === 'text') {
+    // Để đơn giản & không cần font loader: render text thành Sprite
+    const s = props.text || 'Text';
+    const c = document.createElement('canvas');
+    const ctx = c.getContext('2d');
+    const px = 256; c.width = px; c.height = px;
+    ctx.fillStyle = 'rgba(0,0,0,0)';
+    ctx.fillRect(0,0,px,px);
+    ctx.fillStyle = props.color || '#00FF00';
+    ctx.font = 'bold 48px system-ui';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(s, px/2, px/2);
+    const tex = new THREE.CanvasTexture(c);
+    const mat = new THREE.SpriteMaterial({ map: tex, depthWrite:false });
+    node = new THREE.Sprite(mat);
+    // kích thước ~ 12cm
+    node.scale.set(0.12, 0.12, 0.12);
+  } else {
+    // fallback: a small sphere
+    const geo = new THREE.SphereGeometry(0.03, 16, 12);
+    const mat = new THREE.MeshStandardMaterial({ color: '#aaaaaa', emissive:'#111111' });
+    node = new THREE.Mesh(geo, mat);
+  }
+
+  // Apply local matrix (room-local or world depending on bundle.space)
+  const M = mat4FromArray16(webObj.transform);
+  node.matrixAutoUpdate = false;
+  node.matrix.copy(M);
+
+  return node;
+}
+
+async function loadRoomModelFromFile(file) {
+  if (lastModelBlobURL) URL.revokeObjectURL(lastModelBlobURL);
+  const blobURL = URL.createObjectURL(file);
+  lastModelBlobURL = blobURL;
+
+  // choose loader by extension
+  const name = file.name.toLowerCase();
+  if (name.endsWith('.glb') || name.endsWith('.gltf')) {
+    const loader = new GLTFLoader();
+    const gltf = await loader.loadAsync(blobURL);
+    // take gltf.scene
+    return gltf.scene;
+  } else if (name.endsWith('.usd') || name.endsWith('.usdz') || name.endsWith('.usda') || name.endsWith('.usdc')) {
+    const loader = new USDZLoader();
+    const group = await loader.loadAsync(blobURL);
+    return group;
+  } else {
+    throw new Error('Unsupported model format: ' + file.name);
+  }
+}
+
+function renderOnce(){ renderer.render(scene, camera); }
+
+async function tryAssemble() {
+  if (!lastModelBlobURL || !lastJSON) {
+    log('Chờ đủ cả model + JSON …');
+    return;
+  }
+  try {
+    // 1) Clear previous
+    resetScene();
+
+    // 2) Load room model
+    const file = modelInput.files[0];
+    log('Đang load mô hình phòng:', file.name);
+    const roomScene = await loadRoomModelFromFile(file);
+    roomRoot.add(roomScene);
+
+    // 3) Apply roomTransform if space == "room-local"
+    const space = lastJSON.space || 'world';
+    const roomMat = mat4FromArray16(lastJSON.roomTransform || []);
+    roomRoot.matrixAutoUpdate = false;
+    roomRoot.matrix.copy(space === 'room-local' ? roomMat : new THREE.Matrix4().identity());
+
+    // 4) Recreate objects
+    const arr = Array.isArray(lastJSON.objects) ? lastJSON.objects : [];
+    log('Số object:', arr.length, '| space =', space);
+    for (const o of arr) {
+      const node = buildObject(o);
+      if (space === 'room-local') {
+        // giữ local matrix trong hệ room bằng cách add node vào roomRoot,
+        // nhưng vì roomRoot có matrix (không auto update), node.matrix là local
+        // => three sẽ đúng: world = roomRoot.worldMatrix * node.localMatrix
+        roomRoot.add(node);
+      } else {
+        // world-space -> add thẳng vào objectsRoot
+        objectsRoot.add(node);
+      }
+    }
+
+    // 5) Fit view sơ bộ
+    // Lấy bbox của cả scene
+    const box = new THREE.Box3().setFromObject(scene);
+    const size = box.getSize(new THREE.Vector3()).length();
+    const center = box.getCenter(new THREE.Vector3());
+    if (isFinite(size) && size > 0) {
+      controls.target.copy(center);
+      camera.position.copy(center).add(new THREE.Vector3(1, 0.7, 1).multiplyScalar(Math.max(1, size)));
+      controls.update();
+    }
+
+    renderOnce();
+    log('✅ Hoàn tất.');
+  } catch (e) {
+    console.error(e);
+    log('❌ Lỗi assemble:', e.message || e);
+  }
+}
+
+modelInput.addEventListener('change', async () => {
+  clearLog();
+  if (!modelInput.files?.length) return;
+  log('Đã chọn model:', modelInput.files[0].name);
+  await tryAssemble();
+});
+
+jsonInput.addEventListener('change', async () => {
+  clearLog();
+  if (!jsonInput.files?.length) return;
+  const file = jsonInput.files[0];
+  log('Đã chọn JSON:', file.name);
+  try {
+    const txt = await file.text();
+    lastJSON = JSON.parse(txt);
+    // sanity check
+    if (!lastJSON.objects) throw new Error('JSON thiếu trường "objects"');
+    await tryAssemble();
+  } catch (e) {
+    console.error(e);
+    log('❌ JSON lỗi:', e.message || e);
+  }
+});
+
+function animate(){ requestAnimationFrame(animate); renderer.render(scene, camera); }
+animate();
+</script>
+</body>
+</html>
